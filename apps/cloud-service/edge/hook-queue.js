@@ -59,6 +59,16 @@ export class HookQueue {
     this.storage = state.storage;
     this.env = env;
     this.now = () => Date.now();
+    this._sealKey = null;
+    this._sealLabel = null;
+  }
+
+  async _sealKeyFor(label) {
+    if (this._sealKey && this._sealLabel === label) return this._sealKey;
+    const key = await sealKey(this.env, label);
+    this._sealKey = key;
+    this._sealLabel = label;
+    return key;
   }
 
   /** internal only, from the Worker through the binding: POST /accept (the envelope, 202 queued or 200 duplicate) and /forget */
@@ -80,7 +90,7 @@ export class HookQueue {
     const entries = await this.entries();
     if (entries.length >= QUEUE_LIMITS.maxEntries || entries.reduce((n, e) => n + e.bytes, 0) + plain.byteLength > QUEUE_LIMITS.maxBytes) return new Response("queue full", { status: 507 });
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: encoder.encode(id) }, await sealKey(this.env, label), plain));
+    const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: encoder.encode(id) }, await this._sealKeyFor(label), plain));
     const writes = { "meta": { ...(await this.storage.get("meta")), label, host }, [`e:${id}`]: { id, at: now, bytes: sealed.byteLength, chunks: 0, iv: [...iv] } };
     let chunks = 0;
     for (let at = 0; at < sealed.byteLength; at += QUEUE_LIMITS.chunk) writes[`c:${id}:${chunks++}`] = sealed.slice(at, at + QUEUE_LIMITS.chunk);
@@ -96,18 +106,28 @@ export class HookQueue {
     const now = this.now(), meta = await this.storage.get("meta") ?? {};
     for (const [key, until] of await this.storage.list({ prefix: "s:" })) if (until <= now) await this.storage.delete(key);
     const attempts = (meta.attempts ?? 0) + 1;
-    const drop = async (e, reason) => { await this.remove(e.id); audit("edge_hook_dropped", { label: meta.label, id: e.id, reason, attempts, ageMs: now - e.at }); };
+    const drop = async (e, reason) => { await this._removeEntry(e); audit("edge_hook_dropped", { label: meta.label, id: e.id, reason, attempts, ageMs: now - e.at }); };
     let entries = [];
     for (const e of await this.entries()) if (now - e.at >= QUEUE_LIMITS.dropAfterMs) await drop(e, "expired"); else entries.push(e);
+    let left = entries.length;
     if (entries.length) {
       let route;
       try { route = await lookupRoute(meta.label, this.env); } catch { route = undefined; }
-      if (route === null || route?.wakeable === false && !route.awake) for (const e of entries) await drop(e, route === null ? "no_home" : "not_wakeable");
-      else if (route?.awake) {
-        for (const e of entries) if (!(await this.deliver(e, meta, route.upstream, now, attempts, drop))) break;
-      } else if (route) await askWake(meta.label, "webhook", this.env);
+      if (route === null || route?.wakeable === false && !route.awake) {
+        for (const e of entries) await drop(e, route === null ? "no_home" : "not_wakeable");
+        left = 0;
+      } else if (route?.awake) {
+        let delivered = 0;
+        for (const e of entries) {
+          if (await this.deliver(e, meta, route.upstream, now, attempts, drop)) delivered++;
+          else break;
+        }
+        left = entries.length - delivered;
+      } else if (route) {
+        await askWake(meta.label, "webhook", this.env);
+        // left remains entries.length
+      }
     }
-    const left = (await this.entries()).length;
     await this.storage.put("meta", { ...meta, attempts: left ? attempts : 0 });
     if (left) {
       const next = now + Math.min(QUEUE_LIMITS.firstRetryMs * 2 ** (attempts - 1), QUEUE_LIMITS.maxRetryMs);
@@ -124,7 +144,7 @@ export class HookQueue {
       const sealed = new Uint8Array(e.bytes);
       let offset = 0;
       for (let n = 0; n < e.chunks; n++) { const part = parts.get(`c:${e.id}:${n}`); sealed.set(part, offset); offset += part.byteLength; }
-      hook = openEnvelope(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(e.iv), additionalData: encoder.encode(e.id) }, await sealKey(this.env, meta.label), sealed)));
+      hook = openEnvelope(new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(e.iv), additionalData: encoder.encode(e.id) }, await this._sealKeyFor(meta.label), sealed)));
     } catch {
       await drop(e, "unsealable");
       return true;
@@ -132,7 +152,7 @@ export class HookQueue {
     const response = await fetch(upstreamRequest(upstream, meta.host, hook)).catch(() => null);
     await response?.body?.cancel().catch(() => {});
     if (!response || DOWN.includes(response.status)) return false;
-    await this.remove(e.id);
+    await this._removeEntry(e);
     await this.storage.put(`s:${e.id}`, now + QUEUE_LIMITS.seenMs);
     audit("edge_hook_delivered", { label: meta.label, id: e.id, status: response.status, attempts, ageMs: now - e.at });
     return true;
@@ -142,9 +162,12 @@ export class HookQueue {
     return [...(await this.storage.list({ prefix: "e:" })).values()].sort((a, b) => a.at - b.at);
   }
 
+  async _removeEntry(e) {
+    await this.storage.delete([`e:${e.id}`, ...Array.from({ length: e.chunks }, (_, n) => `c:${e.id}:${n}`)]);
+  }
+
   async remove(id) {
     const e = await this.storage.get(`e:${id}`);
-    if (!e) return;
-    await this.storage.delete([`e:${id}`, ...Array.from({ length: e.chunks }, (_, n) => `c:${id}:${n}`)]);
+    if (e) await this._removeEntry(e);
   }
 }
